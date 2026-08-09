@@ -1,0 +1,379 @@
+// ==UserScript==
+// @name         갱십 노래책 신청곡 감지기
+// @namespace    https://github.com/songbook
+// @version      1.3.0
+// @description  SOOP 채팅의 !신청 곡명 또는 !신청 가수 - 곡명 명령을 등록합니다.
+// @match        https://play.sooplive.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const CONFIG = {
+    SUPABASE_URL: "https://sxsvkxdojkqaonbpnjtw.supabase.co",
+    SUPABASE_ANON_KEY: "sb_publishable_2WZkc5lUylSpuiykpINJ5A_Gw6SxYJX",
+  };
+
+  const DOM = {
+    CHAT_CONTAINER_SELECTORS: [
+      "#chat_area",
+      ".chatting-list",
+      "[class*='chatting-list']",
+      "[data-testid='chat-list']",
+    ],
+    MESSAGE_SELECTORS: [
+      "[data-chat-message]",
+      ".chatting-list-item",
+      ".chat-item",
+      "li[class*='chat']",
+    ],
+    MESSAGE_TEXT_SELECTORS: [
+      "[data-chat-text]",
+      ".message",
+      ".msg",
+      "[class*='message']",
+      "[class*='msg']",
+    ],
+    USER_ID_ATTRIBUTES: [
+      "data-user-id",
+      "data-user_id",
+      "data-userid",
+      "user_id",
+    ],
+  };
+
+  const COMMAND_PATTERN = /^!신청\s+(.+?)\s*$/u;
+  const ARTIST_TITLE_PATTERN = /^(.+?)\s*-\s*(.+)$/u;
+  const SONG_CACHE_MS = 60_000;
+  const RECENT_MESSAGE_MS = 5_000;
+  const MESSAGE_SELECTOR = DOM.MESSAGE_SELECTORS.join(",");
+  const processedElements = new WeakSet();
+  const pendingElements = new Set();
+  const recentMessages = new Map();
+  let isFlushScheduled = false;
+  let songsCache = null;
+  let songsCacheExpiresAt = 0;
+  let songsRequest = null;
+
+  function log(event, details = {}) {
+    console.log(`[Songbook] ${event}`, details);
+  }
+
+  function isConfigured() {
+    return (
+      /^https:\/\/.+\.supabase\.co\/?$/u.test(CONFIG.SUPABASE_URL) &&
+      CONFIG.SUPABASE_ANON_KEY !== "YOUR_SUPABASE_ANON_KEY"
+    );
+  }
+
+  function parseCommand(text) {
+    const match = text.trim().match(COMMAND_PATTERN);
+    if (!match) return null;
+
+    const query = match[1].trim();
+    if (!query) return null;
+
+    const artistTitleMatch = query.match(ARTIST_TITLE_PATTERN);
+    if (!artistTitleMatch) return { title: query };
+
+    const artist = artistTitleMatch[1].trim();
+    const title = artistTitleMatch[2].trim();
+    return artist && title ? { artist, title } : null;
+  }
+
+  function readFirstAttribute(element, attributes) {
+    for (const attribute of attributes) {
+      const value = element.getAttribute(attribute)?.trim();
+      if (value) return value;
+    }
+    return null;
+  }
+
+  function normalizeRequesterId(value) {
+    return value
+      .trim()
+      .replace(/\(\d+\)$/u, "")
+      .trim();
+  }
+
+  function getRequester(messageElement) {
+    const soopUserButton = messageElement.querySelector(
+      ".username button[user_id]",
+    );
+    if (soopUserButton) {
+      const requesterId = normalizeRequesterId(
+        soopUserButton.getAttribute("user_id") ?? "",
+      );
+      const requesterNickname =
+        soopUserButton.getAttribute("user_nick")?.trim() || null;
+      if (requesterId) return { requesterId, requesterNickname };
+    }
+
+    const ownId = readFirstAttribute(messageElement, DOM.USER_ID_ATTRIBUTES);
+    if (ownId) {
+      return {
+        requesterId: normalizeRequesterId(ownId),
+        requesterNickname: null,
+      };
+    }
+
+    for (const attribute of DOM.USER_ID_ATTRIBUTES) {
+      const owner = messageElement.querySelector(`[${attribute}]`);
+      const value = owner?.getAttribute(attribute)?.trim();
+      if (value) {
+        return {
+          requesterId: normalizeRequesterId(value),
+          requesterNickname: null,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  function getMessageText(messageElement) {
+    for (const selector of DOM.MESSAGE_TEXT_SELECTORS) {
+      const text = messageElement.querySelector(selector)?.textContent?.trim();
+      if (text) return text;
+    }
+    return messageElement.textContent?.trim() ?? "";
+  }
+
+  function normalize(value) {
+    return value
+      .normalize("NFKC")
+      .trim()
+      .replace(/\s+/gu, "")
+      .toLocaleLowerCase("ko-KR");
+  }
+
+  async function supabaseFetch(path, init = {}) {
+    const response = await fetch(
+      `${CONFIG.SUPABASE_URL.replace(/\/$/u, "")}${path}`,
+      {
+        ...init,
+        headers: {
+          apikey: CONFIG.SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${CONFIG.SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+          ...init.headers,
+        },
+      },
+    );
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw Object.assign(
+        new Error(error.message || `HTTP ${response.status}`),
+        {
+          code: error.code,
+          details: error.details,
+          hint: error.hint,
+          status: response.status,
+        },
+      );
+    }
+
+    return response.status === 204 ? null : response.json();
+  }
+
+  async function getSongs() {
+    if (songsCache && Date.now() < songsCacheExpiresAt) return songsCache;
+    if (songsRequest) return songsRequest;
+
+    songsRequest = supabaseFetch(
+      "/rest/v1/songs?select=id,title,artist,artist_aliases,title_aliases",
+    )
+      .then((songs) => {
+        songsCache = songs;
+        songsCacheExpiresAt = Date.now() + SONG_CACHE_MS;
+        return songs;
+      })
+      .finally(() => {
+        songsRequest = null;
+      });
+
+    return songsRequest;
+  }
+
+  async function findSongs(requestedTitle, requestedArtist = null) {
+    const title = normalize(requestedTitle);
+    const artist = requestedArtist ? normalize(requestedArtist) : null;
+    const songs = await getSongs();
+    return songs
+      .map((song) => {
+        const titleValues = [song.title, ...(song.title_aliases ?? [])];
+        const artistValues = [song.artist, ...(song.artist_aliases ?? [])];
+        const titleIndex = titleValues.findIndex(
+          (value) => normalize(value) === title,
+        );
+        const artistIndex = artist
+          ? artistValues.findIndex((value) => normalize(value) === artist)
+          : 0;
+        if (titleIndex < 0 || artistIndex < 0) return null;
+        return {
+          song,
+          score:
+            (titleIndex === 0 ? 120 : 110) + (artistIndex === 0 ? 100 : 90),
+        };
+      })
+      .filter(Boolean)
+      .sort(
+        (left, right) =>
+          right.score - left.score || left.song.id - right.song.id,
+      )
+      .map(({ song }) => song);
+  }
+
+  async function addSongRequest(songId, requesterId, requesterNickname) {
+    return supabaseFetch("/rest/v1/rpc/public_add_song_request", {
+      method: "POST",
+      body: JSON.stringify({
+        p_requester_id: requesterId,
+        p_requester_nickname: requesterNickname,
+        p_song_id: songId,
+      }),
+    });
+  }
+
+  function isRecentDuplicate(requesterId, text) {
+    const now = Date.now();
+    const key = `${requesterId}\u0000${text}`;
+    for (const [recentKey, timestamp] of recentMessages) {
+      if (now - timestamp > RECENT_MESSAGE_MS) recentMessages.delete(recentKey);
+    }
+    if (recentMessages.has(key)) return true;
+    recentMessages.set(key, now);
+    return false;
+  }
+
+  async function processMessage(messageElement) {
+    const text = getMessageText(messageElement);
+    const command = parseCommand(text);
+    if (!command) return;
+
+    const requester = getRequester(messageElement);
+    if (!requester?.requesterId) {
+      log("신청자 로그인 ID를 찾지 못해 신청을 무시했습니다.", { text });
+      return;
+    }
+    const { requesterId, requesterNickname } = requester;
+    if (isRecentDuplicate(requesterId, text)) return;
+
+    try {
+      const songs = await findSongs(command.title, command.artist);
+      if (songs.length === 0) {
+        log("일치하는 곡이 없습니다.", { ...command, requesterId });
+        return;
+      }
+      if (!command.artist && songs.length > 1) {
+        log("같은 제목의 곡이 여러 개 있어 신청에 실패했습니다.", {
+          ...command,
+          matches: songs.map((song) => `${song.artist} - ${song.title}`),
+          requesterId,
+        });
+        return;
+      }
+
+      const song = songs.sort((left, right) => left.id - right.id)[0];
+
+      const requestId = await addSongRequest(
+        song.id,
+        requesterId,
+        requesterNickname,
+      );
+      log("신청곡을 추가했습니다.", {
+        requestId,
+        requesterId,
+        song: `${song.artist} - ${song.title}`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(
+        message.includes("Duplicate active song request")
+          ? "중복 신청입니다."
+          : message.includes("Chat song requests are disabled")
+            ? "현재 채팅 신청이 중지되어 있습니다."
+            : "신청에 실패했습니다.",
+        {
+          code: error?.code,
+          message,
+          requesterId,
+        },
+      );
+    }
+  }
+
+  function flushPendingMessages() {
+    isFlushScheduled = false;
+    const elements = Array.from(pendingElements);
+    pendingElements.clear();
+    for (const element of elements) void processMessage(element);
+  }
+
+  function enqueueMessage(element) {
+    if (processedElements.has(element)) return;
+    processedElements.add(element);
+    pendingElements.add(element);
+    if (!isFlushScheduled) {
+      isFlushScheduled = true;
+      queueMicrotask(flushPendingMessages);
+    }
+  }
+
+  function collectMessages(node, enqueue) {
+    if (!(node instanceof Element)) return;
+    if (node.matches(MESSAGE_SELECTOR)) enqueue(node);
+    for (const message of node.querySelectorAll(MESSAGE_SELECTOR))
+      enqueue(message);
+  }
+
+  function startChatObserver(container) {
+    collectMessages(container, (element) => processedElements.add(element));
+
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes)
+          collectMessages(node, enqueueMessage);
+      }
+    });
+    observer.observe(container, { childList: true, subtree: true });
+    log("SOOP 채팅 감지를 시작했습니다.");
+  }
+
+  function findChatContainer() {
+    for (const selector of DOM.CHAT_CONTAINER_SELECTORS) {
+      const container = document.querySelector(selector);
+      if (container) return container;
+    }
+    return null;
+  }
+
+  function bootstrap() {
+    if (!isConfigured()) {
+      log("CONFIG의 Supabase URL과 anon key를 먼저 설정해 주세요.");
+      return;
+    }
+
+    const existingContainer = findChatContainer();
+    if (existingContainer) {
+      startChatObserver(existingContainer);
+      return;
+    }
+
+    const pageObserver = new MutationObserver(() => {
+      const container = findChatContainer();
+      if (!container) return;
+      pageObserver.disconnect();
+      startChatObserver(container);
+    });
+    pageObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  bootstrap();
+})();
