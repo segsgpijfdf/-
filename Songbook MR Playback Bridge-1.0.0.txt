@@ -1,0 +1,163 @@
+// ==UserScript==
+// @name         Songbook MR Playback Bridge
+// @namespace    https://github.com/songbook
+// @version      1.0.0
+// @description  Sends actual playback time from an explicitly linked YouTube window to Songbook Admin.
+// @match        https://www.youtube.com/*
+// @match        http://localhost:3000/*
+// @match        http://127.0.0.1:3000/*
+// @match        https://g12songbook.vercel.app/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addValueChangeListener
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+  "use strict";
+  const EVENT = "songbook-mr-playback-v1";
+  const SESSION = "songbook-mr-session-v1";
+  const SAMPLE = "songbook-mr-sample-v1";
+  const uuid = (v) => typeof v === "string" && /^[0-9a-f-]{36}$/i.test(v);
+  const valid = (s) =>
+    s &&
+    uuid(s.controllerId) &&
+    /^[\w-]{11}$/.test(s.videoId) &&
+    Number.isFinite(s.expiresAt) &&
+    s.expiresAt > Date.now() &&
+    s.expiresAt < Date.now() + 135000;
+  if (location.hostname !== "www.youtube.com") {
+    let owner = null;
+    document.addEventListener(`${EVENT}:ping`, () =>
+      document.dispatchEvent(new CustomEvent(`${EVENT}:ready`)),
+    );
+    document.addEventListener(`${EVENT}:session`, async (event) => {
+      if (typeof event.detail !== "string") return;
+      try {
+        const value = JSON.parse(event.detail);
+        if (!valid(value)) return;
+        owner = value.controllerId;
+        await GM_setValue(SESSION, value);
+      } catch {
+        /* Ignore malformed page events. */
+      }
+    });
+    document.addEventListener(`${EVENT}:stop`, async (event) => {
+      const current = await GM_getValue(SESSION, null);
+      if (current?.controllerId === event.detail && owner === event.detail) {
+        owner = null;
+        await GM_setValue(SESSION, null);
+      }
+    });
+    GM_addValueChangeListener(SAMPLE, (_key, _old, value, remote) => {
+      if (remote && value?.controllerId === owner)
+        document.dispatchEvent(
+          new CustomEvent(`${EVENT}:sample`, { detail: JSON.stringify(value) }),
+        );
+    });
+    document.dispatchEvent(new CustomEvent(`${EVENT}:ready`));
+    return;
+  }
+
+  // Only a window explicitly opened by Admin joins a session. Ordinary YouTube tabs do nothing.
+  const controllerId = new URLSearchParams(location.hash.slice(1)).get(
+    "songbook_mr",
+  );
+  if (!uuid(controllerId)) return;
+  const sourceId = crypto.randomUUID();
+  let session = null,
+    video = null,
+    sequence = 0,
+    bound = false,
+    lastPosition = 0;
+  const badge = document.createElement("div");
+  badge.style.cssText =
+    "position:fixed;bottom:12px;left:12px;z-index:2147483647;background:#172554;color:white;padding:8px 12px;border-radius:8px;font:14px sans-serif;pointer-events:none";
+  document.body.appendChild(badge);
+  const setSession = (value) => {
+    session = value;
+  };
+  GM_addValueChangeListener(SESSION, (_key, _old, value) => setSession(value));
+  void Promise.resolve(GM_getValue(SESSION, null)).then(setSession);
+  function emit() {
+    const linked = valid(session) && session.controllerId === controllerId;
+    const correctVideo =
+      new URL(location.href).searchParams.get("v") === session?.videoId;
+    const next = document.querySelector("#movie_player video.html5-main-video");
+    if (!linked || !correctVideo) {
+      if (bound) video?.pause();
+      badge.textContent = "Songbook MR 연결 종료 · Admin에서 다시 준비하세요";
+      if (bound && session?.controllerId === controllerId) {
+        void GM_setValue(SAMPLE, {
+          controllerId,
+          sourceId,
+          videoId: session.videoId,
+          sequence: ++sequence,
+          state: "paused",
+          positionMs: lastPosition,
+          durationMs: 0,
+          rate: 1,
+          sampledAtMs: Date.now(),
+        });
+      }
+      bound = false;
+      return;
+    }
+    if (next !== video) {
+      if (video)
+        for (const event of events) video.removeEventListener(event, emit);
+      video = next;
+      if (video)
+        for (const event of events) video.addEventListener(event, emit);
+    }
+    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) {
+      badge.textContent = "Songbook MR · 영상 준비 중";
+      return;
+    }
+    const ad = document.querySelector(
+      "#movie_player.ad-showing, #movie_player.ad-interrupting",
+    );
+    const state = ad
+      ? "buffering"
+      : video.ended
+        ? "ended"
+        : video.paused
+          ? "paused"
+          : video.seeking || video.readyState < 3
+            ? "buffering"
+            : "playing";
+    if (!ad) lastPosition = video.currentTime * 1000;
+    bound = true;
+    badge.textContent = ad
+      ? "Songbook MR · 광고 중 가사 대기"
+      : `Songbook MR 연결됨 · ${(lastPosition / 1000).toFixed(1)}초 · ${state}`;
+    void GM_setValue(SAMPLE, {
+      controllerId,
+      sourceId,
+      videoId: session.videoId,
+      sequence: ++sequence,
+      state,
+      positionMs: lastPosition,
+      durationMs: ad ? 0 : video.duration * 1000,
+      rate: video.playbackRate,
+      sampledAtMs: Date.now(),
+    });
+  }
+  const events = [
+    "playing",
+    "pause",
+    "seeking",
+    "seeked",
+    "waiting",
+    "ended",
+    "ratechange",
+    "loadedmetadata",
+  ];
+  // Local bridge heartbeat only. Admin suppresses unchanged clock writes to Supabase.
+  window.setInterval(emit, 1000);
+  window.addEventListener("pagehide", () => {
+    video?.pause();
+    emit();
+  });
+  emit();
+})();
